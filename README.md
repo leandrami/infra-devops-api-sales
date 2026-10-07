@@ -7,7 +7,7 @@ A API tem: `POST /checkout` (reserva atômica de ingressos no Redis + pedido no 
 ## Visão geral
 
 ```
-Dev ──push──▶ GitHub ──▶ GitHub Actions (test ∥ validate ▶ build ▶ scan ▶ push GHCR ▶ deploy manual)
+Dev ──push──▶ GitHub ──▶ GitHub Actions (segredos ∥ testes ∥ SAST ∥ IaC ▶ build ▶ Trivy ▶ Docker Hub ∥ DAST ∥ Terraform)
                                                    │
                          ┌─────────────────────────┴───────────────┐
                          ▼                                         ▼
@@ -24,7 +24,8 @@ Dev ──push──▶ GitHub ──▶ GitHub Actions (test ∥ validate ▶ b
 | `Dockerfile` / `.dockerignore` | Imagem multi-stage, enxuta, usuário não-root, HEALTHCHECK |
 | `docker-compose.yml` | Ambiente local completo, com healthchecks, limites de recurso e Redis persistente (AOF) |
 | `.env.example` | Modelo de variáveis (o `.env` real não é versionado) |
-| `.github/workflows/ci-cd.yml` | Pipeline: testes, validação de manifestos, build, scan, push e deploy manual |
+| `.github/workflows/ci-cd.yml` | Pipeline DevSecOps: segredos, testes, SAST, IaC, imagem, DAST e Terraform |
+| `terraform/` | Infraestrutura como código (9 recursos) para o LocalStack |
 | `k8s/*.yaml` | Namespace, config, Postgres, Redis, API, HPA e Ingress |
 | `monitoring/` | Prometheus e Grafana provisionados como código |
 | `scripts/load-test.sh` | Carga na exportação pesada para demonstrar limites e autoscaling |
@@ -32,7 +33,7 @@ Dev ──push──▶ GitHub ──▶ GitHub Actions (test ∥ validate ▶ b
 
 ## Pré-requisitos
 
-Docker + Docker Compose v2, Git e, opcionalmente, `kubectl` + minikube/kind.
+Docker + Docker Compose v2, Git e Terraform. Opcional: `kubectl` + minikube/kind (parte extra de Kubernetes).
 
 ## Execução local (Docker Compose)
 
@@ -47,25 +48,51 @@ Serviços: API `http://localhost:3000` · Prometheus `http://localhost:9090` · 
 
 ## Testando a API
 
-> O checkout só funciona se o estoque existir no Redis (chave `event:<eventId>:tickets`). Sem o `make seed`, a resposta é "sold out".
+Rotas: `POST /checkout`, `POST /tickets/export`, `GET /metrics` e `GET /health`. No checkout, `eventId`, `userId` e `quantity` são obrigatórios. Na exportação, `records` é opcional (padrão: 500000).
+
+> O checkout só funciona se o estoque existir no Redis (chave `event:<eventId>:tickets`). Sem o `make seed`, a resposta é 409 (esgotado).
 
 ```bash
+# 1) saúde e métricas
 curl -i http://localhost:3000/health
 curl -s http://localhost:3000/metrics | head
+
+# 2) compra válida (esperado: HTTP 201 e "Checkout successful")
 curl -i -X POST http://localhost:3000/checkout \
   -H "Content-Type: application/json" \
   -d '{"eventId":"evt-1","userId":"user-1","quantity":2}'
-docker compose exec redis redis-cli GET event:evt-1:tickets   # deve mostrar 98
+
+# 3) estoque no Redis (esperado: 98) e pedido no Postgres
+docker compose exec redis redis-cli GET event:evt-1:tickets
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM orders;"'
+
+# 4) campo faltando (esperado: HTTP 400, "Missing required fields")
+curl -i -X POST http://localhost:3000/checkout \
+  -H "Content-Type: application/json" \
+  -d '{"eventId":"evt-1","userId":"user-1"}'
+
+# 5) estoque insuficiente (esperado: HTTP 409, "Tickets sold out or insufficient quantity")
+curl -i -X POST http://localhost:3000/checkout \
+  -H "Content-Type: application/json" \
+  -d '{"eventId":"evt-1","userId":"user-1","quantity":1000}'
+
+# 6) exportação pesada, com poucos registros para o teste (esperado: HTTP 200, "Export completed")
+curl -i -X POST http://localhost:3000/tickets/export \
+  -H "Content-Type: application/json" \
+  -d '{"records":100000}'
 ```
 
-Testes unitários: `npm ci && npm test`.
+A exportação bloqueia o event loop e consome CPU e memória de propósito; com o padrão de 500000 registros ela leva mais tempo e a API fica lenta durante esse período. Testes unitários: `npm ci && npm test`.
+
+> As tabelas são criadas automaticamente (`synchronize: true` no TypeORM). Em produção real o ideal é usar migrations.
 
 ## Demonstrando limites de recurso e escalabilidade
 
 A exportação (`POST /tickets/export`) é pesada por projeto: aloca muita memória e ocupa a CPU. Para observar o comportamento da infraestrutura:
 
 ```bash
-make load                       # 20 exportações em paralelo (N=50 make load para mais)
+make load                       # 20 exportações em paralelo (500000 registros cada)
+N=50 RECORDS=200000 make load   # ajuste a quantidade de requisições e de registros
 docker stats                    # a API respeita 0,5 CPU e 512 MB
 ```
 
@@ -78,11 +105,30 @@ kubectl -n sales get hpa -w     # réplicas sobem de 2 até 6
 kubectl -n sales get pods       # observe reinícios (OOMKilled), se houver
 ```
 
-## Deploy em Kubernetes (minikube/kind)
+## Infraestrutura como código (Terraform + LocalStack)
+
+O diretório `terraform/` descreve, em código, 9 recursos de uma AWS simulada pelo LocalStack (sem custo): VPC, sub-rede, internet gateway, tabela de rotas, associação de rota, security group (firewall), instância EC2, bucket S3 e versionamento do bucket. A EC2 é simulada; os containers da aplicação rodam via Docker Compose.
+
+```bash
+# requer Terraform instalado
+docker compose --profile iac up -d localstack
+curl -s http://localhost:4566/_localstack/health   # serviços "available"
+cd terraform
+terraform init
+terraform apply -auto-approve                      # 9 recursos criados
+terraform output
+```
+
+Atalhos: `make tf-up` e `make tf-down` (remove tudo com `terraform destroy`). O estado local (`.tfstate`) não vai para o Git.
+
+## Extra (opcional): Kubernetes (minikube/kind)
+
+Não faz parte da pipeline; mostra como a mesma imagem rodaria em um cluster.
+
 
 ```bash
 minikube start && minikube addons enable ingress && minikube addons enable metrics-server
-# ajuste a imagem em k8s/api.yaml (ghcr.io/<usuario>/<repo>)
+# ajuste a imagem em k8s/api.yaml (<usuario-dockerhub>/<repo>)
 export DB_PASSWORD='senha-forte'
 make k8s-up
 make k8s-seed
@@ -91,11 +137,23 @@ kubectl -n sales get pods
 
 Remover tudo: `make k8s-down`.
 
-## Pipeline CI/CD
+## Pipeline CI/CD (DevSecOps)
 
-- **Pull Request e push:** instala, compila e testa; valida os manifestos Kubernetes (kubeconform) e o `docker-compose.yml`; faz o build da imagem.
-- **Push na `main`:** publica a imagem no GHCR (tag = SHA do commit e `latest`) e faz scan de vulnerabilidades com Trivy.
-- **Deploy:** job manual (*Actions → Run workflow*), pois exige um cluster acessível e o secret `KUBE_CONFIG` (kubeconfig em base64). Sem cluster, o job fica *skipped*.
+A cada push na `main` (e em pull requests), o GitHub Actions executa:
+
+| Etapa | Ferramenta | O que faz |
+|---|---|---|
+| Segredos | Gitleaks | Procura credenciais vazadas no código e no histórico |
+| Testes | Node.js + Jest | Compila (`tsc`) e roda os testes |
+| SAST | Semgrep | Análise estática do código-fonte |
+| Scan de IaC | Checkov | Verifica Dockerfile, Terraform e manifestos |
+| Imagem | Docker + Trivy | Build, scan de vulnerabilidades e push no Docker Hub (tags SHA e `latest`) |
+| DAST | OWASP ZAP | Ataque simulado contra a API em execução |
+| Infraestrutura | Terraform + LocalStack | Cria 9 recursos numa AWS simulada |
+
+**Secrets do GitHub** (*Settings → Secrets and variables → Actions*): `DOCKERHUB_USERNAME` e `DOCKERHUB_TOKEN` (token de acesso criado no Docker Hub). Sem eles, a imagem é construída e analisada, mas não publicada, e a pipeline continua verde.
+
+Gitleaks, testes e Terraform bloqueiam a pipeline se falharem. SAST, Checkov, Trivy e DAST funcionam em modo relatório: mostram os achados sem bloquear.
 
 ## Justificativa de arquitetura
 
@@ -114,6 +172,12 @@ Remover tudo: `make k8s-down`.
 **Segurança.** Contêiner não-root, sem escalada de privilégios, limites de recursos; credenciais fora do código (`.env` ignorado, Secrets do Kubernetes e do GitHub); banco e Redis só na rede interna; scan de vulnerabilidades no pipeline.
 
 **Observabilidade.** O `/metrics` alimenta Prometheus e Grafana (provisionados como código), mostrando latência, requisições e erros durante a carga.
+
+**Infraestrutura como código (Terraform).** A infraestrutura de nuvem também é código: o mesmo `terraform apply` gera sempre o mesmo ambiente, e cada mudança fica registrada e revisável no Git. O LocalStack permite validar tudo sem custo.
+
+**Segurança integrada ao pipeline (DevSecOps).** A segurança é verificada a cada push, antes de o código ir para o ar: Gitleaks (segredos), Semgrep (SAST), Checkov (IaC), Trivy (imagem) e OWASP ZAP (DAST, com a API rodando). Problemas aparecem cedo, quando custam pouco para corrigir.
+
+**Entrega por imagem versionada.** A imagem é publicada no Docker Hub com a tag `latest` e o SHA do commit, o que mostra exatamente qual alteração gerou cada versão e permite voltar a uma versão anterior.
 
 ## Limitações e melhorias futuras
 

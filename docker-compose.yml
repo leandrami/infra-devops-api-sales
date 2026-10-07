@@ -62,6 +62,14 @@ services:
     depends_on:
       - prometheus
 
+  localstack:
+    image: localstack/localstack:3.8
+    profiles: ["iac"]
+    environment:
+      SERVICES: ec2,s3,sts
+    ports:
+      - "4566:4566"
+
 volumes:
   pgdata:
   redisdata:

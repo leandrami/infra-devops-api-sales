@@ -1,4 +1,4 @@
-.PHONY: up down logs test seed k8s-up k8s-seed k8s-down load
+.PHONY: up down logs test seed k8s-up k8s-seed k8s-down load tf-up tf-down
 up:       ; cp -n .env.example .env || true; docker compose up -d --build
 down:     ; docker compose down
 logs:     ; docker compose logs -f api
@@ -12,3 +12,5 @@ k8s-down: ; kubectl delete namespace sales
 seed:     ; docker compose exec redis redis-cli SET event:evt-1:tickets 100
 k8s-seed: ; kubectl -n sales exec deploy/redis -- redis-cli SET event:evt-1:tickets 100
 load:     ; ./scripts/load-test.sh $${URL:-http://localhost:3000} $${N:-20}
+tf-up:    ; docker compose --profile iac up -d localstack && cd terraform && terraform init && terraform apply -auto-approve
+tf-down:  ; cd terraform && terraform destroy -auto-approve

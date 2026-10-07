@@ -29,8 +29,8 @@ spec:
           command: ["sh", "-c", "until nc -z postgres 5432 && nc -z redis 6379; do echo aguardando dependencias; sleep 2; done"]
       containers:
         - name: api
-          # Troque pelo seu repositório (ghcr.io/<usuario>/<repo>)
-          image: ghcr.io/SEU_USUARIO/infra-devops-api-sales:latest
+          # Troque pelo seu repositório (<usuario-dockerhub>/<repo>)
+          image: SEU_USUARIO_DOCKERHUB/infra-devops-api-sales:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
